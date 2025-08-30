@@ -2,7 +2,8 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
-#include <WiFiClient.h>
+#include "esphome/components/wifi/wifi_component.h"
+#include "esphome/components/network/util.h"
 
 
 namespace esphome {
