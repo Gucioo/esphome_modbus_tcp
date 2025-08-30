@@ -1,12 +1,9 @@
 #include "modbus_tcp_16.h"
 #include "esphome/core/log.h"
 #include "esphome/components/wifi/wifi_component.h"
-#include "esphome/components/network/util.h"
 
 namespace esphome {
 namespace modbus_tcp_16 {
-
-static const char *const TAG = "modbus_tcp_16";
 
 void ModbusTCP16::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Modbus TCP sensor...");
@@ -32,6 +29,11 @@ void ModbusTCP16::loop() {
     }
     last_update_ = now;
   }
+  
+  // If waiting for response, try to read data
+  if (waiting_for_response_ && connected_) {
+    read_response();
+  }
 }
 
 void ModbusTCP16::connect_to_server() {
@@ -44,67 +46,80 @@ void ModbusTCP16::connect_to_server() {
   ESP_LOGD(TAG, "Connecting to Modbus TCP server %s:%d", host_.c_str(), port_);
   
   // Create socket
-  socket_ = socket::socket_ip(SOCK_STREAM, 0);
-  if (socket_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to create socket");
+  socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+  if (socket_fd_ < 0) {
+    ESP_LOGE(TAG, "Failed to create socket: %s", strerror(errno));
     return;
   }
   
   // Set socket to non-blocking
-  if (socket_->setblocking(false) != 0) {
-    ESP_LOGE(TAG, "Failed to set socket non-blocking");
-    socket_ = nullptr;
+  int flags = fcntl(socket_fd_, F_GETFL, 0);
+  if (fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+    ESP_LOGE(TAG, "Failed to set socket non-blocking: %s", strerror(errno));
+    close(socket_fd_);
+    socket_fd_ = -1;
     return;
   }
   
-  // Resolve IP address
-  sockaddr_storage addr;
-  socklen_t addrlen = sizeof(addr);
-  if (!network::resolve_ip_address(host_.c_str(), &addr, &addrlen)) {
-    ESP_LOGE(TAG, "Failed to resolve IP address for %s", host_.c_str());
-    socket_ = nullptr;
+  // Resolve hostname
+  struct hostent *he = gethostbyname(host_.c_str());
+  if (he == nullptr) {
+    ESP_LOGE(TAG, "Failed to resolve hostname %s", host_.c_str());
+    close(socket_fd_);
+    socket_fd_ = -1;
     return;
   }
   
-  // Set port
-  if (addr.ss_family == AF_INET) {
-    ((sockaddr_in *)&addr)->sin_port = htons(port_);
-  } else if (addr.ss_family == AF_INET6) {
-    ((sockaddr_in6 *)&addr)->sin6_port = htons(port_);
-  }
+  // Setup server address
+  struct sockaddr_in server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(port_);
+  memcpy(&server_addr.sin_addr.s_addr, he->h_addr, he->h_length);
   
   // Attempt connection
-  int result = socket_->connect((sockaddr *)&addr, addrlen);
+  int result = connect(socket_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr));
   if (result == 0 || errno == EINPROGRESS) {
     connected_ = true;
     ESP_LOGD(TAG, "Connection initiated to %s:%d", host_.c_str(), port_);
   } else {
     ESP_LOGE(TAG, "Failed to connect to %s:%d: %s", host_.c_str(), port_, strerror(errno));
-    socket_ = nullptr;
+    close(socket_fd_);
+    socket_fd_ = -1;
   }
 }
 
 void ModbusTCP16::disconnect_from_server() {
-  if (socket_) {
+  if (socket_fd_ >= 0) {
     ESP_LOGD(TAG, "Disconnecting from Modbus server");
-    socket_->close();
-    socket_ = nullptr;
+    close(socket_fd_);
+    socket_fd_ = -1;
   }
   connected_ = false;
   waiting_for_response_ = false;
 }
 
 void ModbusTCP16::send_modbus_request() {
-  if (!socket_ || !connected_ || waiting_for_response_) {
-    ESP_LOGW(TAG, "Cannot send request: socket=%p, connected=%d, waiting=%d", 
-             socket_.get(), connected_, waiting_for_response_);
+  if (socket_fd_ < 0 || !connected_ || waiting_for_response_) {
+    ESP_LOGW(TAG, "Cannot send request: socket=%d, connected=%d, waiting=%d", 
+             socket_fd_, connected_, waiting_for_response_);
     return;
   }
   
-  // Check if socket is actually ready for writing
-  check_connection();
-  if (!connected_) {
-    return;
+  // Check if socket is ready for writing
+  fd_set write_fds;
+  FD_ZERO(&write_fds);
+  FD_SET(socket_fd_, &write_fds);
+  
+  struct timeval timeout = {0, 0}; // Non-blocking check
+  int ready = select(socket_fd_ + 1, nullptr, &write_fds, nullptr, &timeout);
+  
+  if (ready <= 0) {
+    if (ready < 0) {
+      ESP_LOGE(TAG, "Socket select error: %s", strerror(errno));
+      disconnect_from_server();
+    }
+    return; // Socket not ready yet
   }
   
   // Increment transaction ID
@@ -134,10 +149,12 @@ void ModbusTCP16::send_modbus_request() {
            transaction_id_, slave_id_, register_address_, register_count_);
   
   // Send the request
-  ssize_t written = socket_->send(request.data(), request.size(), MSG_DONTWAIT);
+  ssize_t written = send(socket_fd_, request.data(), request.size(), MSG_DONTWAIT);
   if (written < 0) {
-    ESP_LOGE(TAG, "Failed to send Modbus request: %s", strerror(errno));
-    disconnect_from_server();
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ESP_LOGE(TAG, "Failed to send Modbus request: %s", strerror(errno));
+      disconnect_from_server();
+    }
     return;
   } else if (written != (ssize_t)request.size()) {
     ESP_LOGW(TAG, "Partial send: %d/%d bytes", written, request.size());
@@ -149,18 +166,27 @@ void ModbusTCP16::send_modbus_request() {
   response_buffer_.clear();
   
   ESP_LOGV(TAG, "Modbus request sent successfully (%d bytes)", written);
-  
-  // Start reading response immediately
-  handle_response();
 }
 
-void ModbusTCP16::handle_response() {
-  if (!socket_ || !waiting_for_response_) {
+void ModbusTCP16::read_response() {
+  if (socket_fd_ < 0 || !waiting_for_response_) {
     return;
   }
   
+  // Check if data is available to read
+  fd_set read_fds;
+  FD_ZERO(&read_fds);
+  FD_SET(socket_fd_, &read_fds);
+  
+  struct timeval timeout = {0, 0}; // Non-blocking check
+  int ready = select(socket_fd_ + 1, &read_fds, nullptr, nullptr, &timeout);
+  
+  if (ready <= 0) {
+    return; // No data available or error
+  }
+  
   uint8_t buffer[256];
-  ssize_t received = socket_->recv(buffer, sizeof(buffer), MSG_DONTWAIT);
+  ssize_t received = recv(socket_fd_, buffer, sizeof(buffer), MSG_DONTWAIT);
   
   if (received > 0) {
     ESP_LOGV(TAG, "Received %d bytes from Modbus server", received);
@@ -185,14 +211,14 @@ void ModbusTCP16::handle_response() {
 }
 
 void ModbusTCP16::check_connection() {
-  if (!socket_) {
+  if (socket_fd_ < 0) {
     connected_ = false;
     return;
   }
   
-  // Check if connection is still valid by trying to read
+  // Check if connection is still valid
   if (connected_) {
-    handle_response(); // This will also handle any connection errors
+    read_response(); // This will also handle any connection errors
   }
 }
 
