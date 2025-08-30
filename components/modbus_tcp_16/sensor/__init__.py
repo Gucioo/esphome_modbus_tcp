@@ -2,9 +2,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import sensor
 from esphome.const import (
-    CONF_HOST,
     CONF_ID,
-    CONF_PORT,
     CONF_UPDATE_INTERVAL,
     DEVICE_CLASS_EMPTY,
     STATE_CLASS_MEASUREMENT,
@@ -19,7 +17,9 @@ CODEOWNERS = ["@Gucioo"]
 modbus_tcp_16_ns = cg.esphome_ns.namespace("modbus_tcp_16")
 ModbusTCP16 = modbus_tcp_16_ns.class_("ModbusTCP16", cg.Component, sensor.Sensor)
 
-# Configuration schema
+# Configuration constants - define our own since they're not in esphome.const
+CONF_HOST = "host"
+CONF_PORT = "port"
 CONF_SLAVE_ID = "slave_id"
 CONF_REGISTER_ADDRESS = "register_address"
 CONF_REGISTER_COUNT = "register_count"
