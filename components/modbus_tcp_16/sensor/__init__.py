@@ -2,6 +2,8 @@ import esphome.codegen as cg
 from esphome.components import sensor
 import esphome.config_validation as cv
 
+DEPENDENCIES = ["wifi", "network"]
+
 CODEOWNERS = ["@creepystefan"]
 
 CONF_FUNCTIONCODE =  'functioncode'
