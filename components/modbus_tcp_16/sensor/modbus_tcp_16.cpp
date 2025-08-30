@@ -1,6 +1,7 @@
 #include "modbus_tcp_16.h"
 #include "esphome/core/log.h"
 #include "esphome/components/wifi/wifi_component.h"
+#include "esphome/components/network/util.h"
 
 namespace esphome {
 namespace modbus_tcp_16 {
@@ -9,28 +10,6 @@ static const char *const TAG = "modbus_tcp_16";
 
 void ModbusTCP16::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Modbus TCP sensor...");
-  
-  // Initialize TCP client
-  tcp_client_ = new AsyncClient();
-  
-  // Set up callbacks using lambda functions
-  tcp_client_->onConnect([this](void* arg, AsyncClient* client) {
-    this->on_tcp_connect();
-  });
-  
-  tcp_client_->onDisconnect([this](void* arg, AsyncClient* client) {
-    this->on_tcp_disconnect();
-  });
-  
-  tcp_client_->onError([this](void* arg, AsyncClient* client, int8_t error) {
-    this->on_tcp_error(error);
-  });
-  
-  tcp_client_->onData([this](void* arg, AsyncClient* client, void* data, size_t len) {
-    this->on_tcp_data((const uint8_t*)data, len);
-  });
-  
-  ESP_LOGCONFIG(TAG, "Modbus TCP sensor configured for %s:%d", host_.c_str(), port_);
 }
 
 void ModbusTCP16::loop() {
@@ -47,7 +26,8 @@ void ModbusTCP16::loop() {
   if (!waiting_for_response_ && (now - last_update_ > update_interval_)) {
     if (!connected_) {
       connect_to_server();
-    } else {
+    }
+    if (connected_) {
       send_modbus_request();
     }
     last_update_ = now;
@@ -61,41 +41,69 @@ void ModbusTCP16::connect_to_server() {
     return;
   }
   
-  if (tcp_client_->connected()) {
-    ESP_LOGD(TAG, "Already connected to server");
-    connected_ = true;
+  ESP_LOGD(TAG, "Connecting to Modbus TCP server %s:%d", host_.c_str(), port_);
+  
+  // Create socket
+  socket_ = socket::socket_ip(SOCK_STREAM, 0);
+  if (socket_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create socket");
     return;
   }
   
-  ESP_LOGD(TAG, "Connecting to Modbus TCP server %s:%d", host_.c_str(), port_);
-  
-  if (!tcp_client_->connect(host_.c_str(), port_)) {
-    ESP_LOGE(TAG, "Failed to initiate connection to %s:%d", host_.c_str(), port_);
+  // Set socket to non-blocking
+  if (socket_->setblocking(false) != 0) {
+    ESP_LOGE(TAG, "Failed to set socket non-blocking");
+    socket_ = nullptr;
+    return;
   }
-  // Connection result will be handled in callbacks
+  
+  // Resolve IP address
+  sockaddr_storage addr;
+  socklen_t addrlen = sizeof(addr);
+  if (!network::resolve_ip_address(host_.c_str(), &addr, &addrlen)) {
+    ESP_LOGE(TAG, "Failed to resolve IP address for %s", host_.c_str());
+    socket_ = nullptr;
+    return;
+  }
+  
+  // Set port
+  if (addr.ss_family == AF_INET) {
+    ((sockaddr_in *)&addr)->sin_port = htons(port_);
+  } else if (addr.ss_family == AF_INET6) {
+    ((sockaddr_in6 *)&addr)->sin6_port = htons(port_);
+  }
+  
+  // Attempt connection
+  int result = socket_->connect((sockaddr *)&addr, addrlen);
+  if (result == 0 || errno == EINPROGRESS) {
+    connected_ = true;
+    ESP_LOGD(TAG, "Connection initiated to %s:%d", host_.c_str(), port_);
+  } else {
+    ESP_LOGE(TAG, "Failed to connect to %s:%d: %s", host_.c_str(), port_, strerror(errno));
+    socket_ = nullptr;
+  }
 }
 
 void ModbusTCP16::disconnect_from_server() {
-  if (tcp_client_ && connected_) {
+  if (socket_) {
     ESP_LOGD(TAG, "Disconnecting from Modbus server");
-    tcp_client_->close(true);
-  }
-  connected_ = false;
-  waiting_for_response_ = false;
-}
-
-void ModbusTCP16::cleanup_connection() {
-  if (tcp_client_) {
-    delete tcp_client_;
-    tcp_client_ = nullptr;
+    socket_->close();
+    socket_ = nullptr;
   }
   connected_ = false;
   waiting_for_response_ = false;
 }
 
 void ModbusTCP16::send_modbus_request() {
-  if (!connected_ || waiting_for_response_) {
-    ESP_LOGW(TAG, "Cannot send request: connected=%d, waiting=%d", connected_, waiting_for_response_);
+  if (!socket_ || !connected_ || waiting_for_response_) {
+    ESP_LOGW(TAG, "Cannot send request: socket=%p, connected=%d, waiting=%d", 
+             socket_.get(), connected_, waiting_for_response_);
+    return;
+  }
+  
+  // Check if socket is actually ready for writing
+  check_connection();
+  if (!connected_) {
     return;
   }
   
@@ -126,11 +134,13 @@ void ModbusTCP16::send_modbus_request() {
            transaction_id_, slave_id_, register_address_, register_count_);
   
   // Send the request
-  size_t written = tcp_client_->write((const char*)request.data(), request.size());
-  if (written != request.size()) {
-    ESP_LOGE(TAG, "Failed to send complete Modbus request: sent %d/%d bytes", written, request.size());
+  ssize_t written = socket_->send(request.data(), request.size(), MSG_DONTWAIT);
+  if (written < 0) {
+    ESP_LOGE(TAG, "Failed to send Modbus request: %s", strerror(errno));
     disconnect_from_server();
     return;
+  } else if (written != (ssize_t)request.size()) {
+    ESP_LOGW(TAG, "Partial send: %d/%d bytes", written, request.size());
   }
   
   // Mark as waiting for response
@@ -138,40 +148,52 @@ void ModbusTCP16::send_modbus_request() {
   request_start_time_ = millis();
   response_buffer_.clear();
   
-  ESP_LOGV(TAG, "Modbus request sent successfully");
-}
-
-void ModbusTCP16::on_tcp_connect() {
-  ESP_LOGD(TAG, "Connected to Modbus TCP server %s:%d", host_.c_str(), port_);
-  connected_ = true;
-  waiting_for_response_ = false;
+  ESP_LOGV(TAG, "Modbus request sent successfully (%d bytes)", written);
   
-  // Send initial request
-  send_modbus_request();
+  // Start reading response immediately
+  handle_response();
 }
 
-void ModbusTCP16::on_tcp_disconnect() {
-  ESP_LOGD(TAG, "Disconnected from Modbus TCP server");
-  connected_ = false;
-  waiting_for_response_ = false;
-  response_buffer_.clear();
-}
-
-void ModbusTCP16::on_tcp_error(int8_t error) {
-  ESP_LOGE(TAG, "TCP connection error: %d", error);
-  connected_ = false;
-  waiting_for_response_ = false;
-  response_buffer_.clear();
-}
-
-void ModbusTCP16::on_tcp_data(const uint8_t *data, size_t len) {
-  ESP_LOGV(TAG, "Received %d bytes from Modbus server", len);
+void ModbusTCP16::handle_response() {
+  if (!socket_ || !waiting_for_response_) {
+    return;
+  }
   
-  // Append received data to buffer
-  response_buffer_.insert(response_buffer_.end(), data, data + len);
+  uint8_t buffer[256];
+  ssize_t received = socket_->recv(buffer, sizeof(buffer), MSG_DONTWAIT);
   
-  // Try to process complete response
-  process_modbus_response();
+  if (received > 0) {
+    ESP_LOGV(TAG, "Received %d bytes from Modbus server", received);
+    
+    // Append received data to buffer
+    response_buffer_.insert(response_buffer_.end(), buffer, buffer + received);
+    
+    // Try to process complete response
+    process_modbus_response();
+    
+  } else if (received == 0) {
+    // Connection closed by remote
+    ESP_LOGD(TAG, "Connection closed by server");
+    disconnect_from_server();
+    
+  } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    // Real error occurred
+    ESP_LOGE(TAG, "Socket receive error: %s", strerror(errno));
+    disconnect_from_server();
+  }
+  // EAGAIN/EWOULDBLOCK means no data available yet - that's normal for non-blocking
+}
+
+void ModbusTCP16::check_connection() {
+  if (!socket_) {
+    connected_ = false;
+    return;
+  }
+  
+  // Check if connection is still valid by trying to read
+  if (connected_) {
+    handle_response(); // This will also handle any connection errors
+  }
 }
 
 void ModbusTCP16::process_modbus_response() {
@@ -223,13 +245,6 @@ void ModbusTCP16::process_modbus_response() {
   // Process response based on function code
   if (function_code == 0x03) {
     // Read Holding Registers response
-    if (response_buffer_.size() < 9) {
-      ESP_LOGW(TAG, "Invalid response length for function 0x03");
-      waiting_for_response_ = false;
-      response_buffer_.clear();
-      return;
-    }
-    
     uint8_t byte_count = response_buffer_[8];
     
     if (response_buffer_.size() < (9 + byte_count)) {
@@ -240,14 +255,14 @@ void ModbusTCP16::process_modbus_response() {
     
     ESP_LOGD(TAG, "Processing %d bytes of register data", byte_count);
     
-    // Extract first register value (16-bit)
+    // Extract first register value (16-bit, big-endian)
     if (byte_count >= 2) {
       uint16_t register_value = (response_buffer_[9] << 8) | response_buffer_[10];
       
       ESP_LOGD(TAG, "Register %d value: %d (0x%04X)", register_address_, register_value, register_value);
       
       // Publish the value as sensor reading
-      this->publish_state(register_value);
+      this->publish_state(static_cast<float>(register_value));
     } else {
       ESP_LOGW(TAG, "Insufficient register data: %d bytes", byte_count);
     }
@@ -270,8 +285,7 @@ void ModbusTCP16::process_modbus_response() {
   waiting_for_response_ = false;
   response_buffer_.clear();
   
-  // Disconnect after successful read (optional - saves resources)
-  // Comment out next line if you want to keep connection open
+  // Disconnect after successful read to save resources
   disconnect_from_server();
 }
 
