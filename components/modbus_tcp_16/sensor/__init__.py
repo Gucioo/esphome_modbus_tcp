@@ -10,7 +10,7 @@ from esphome.const import (
 )
 
 # Dependencies - use ESPHome's built-in networking
-DEPENDENCIES = ["wifi", "network", "socket"]
+DEPENDENCIES = ["wifi", "network"]
 CODEOWNERS = ["@Gucioo"]
 
 # Namespace and class definitions
