@@ -9,8 +9,8 @@ from esphome.const import (
     UNIT_EMPTY,
 )
 
-# Dependencies - CRITICAL for networking
-DEPENDENCIES = ["wifi", "network"]
+# Dependencies - use ESPHome's built-in networking
+DEPENDENCIES = ["wifi", "network", "socket"]
 CODEOWNERS = ["@Gucioo"]
 
 # Namespace and class definitions
@@ -55,5 +55,4 @@ async def to_code(config):
     cg.add(var.set_register_count(config[CONF_REGISTER_COUNT]))
     cg.add(var.set_update_interval(config[CONF_UPDATE_INTERVAL].total_milliseconds))
 
-    # Add library dependencies for AsyncTCP
-    cg.add_library("AsyncTCP", "1.1.1")
+    # No external libraries needed - ESPHome has built-in socket support
