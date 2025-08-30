@@ -1,7 +1,8 @@
 #pragma once
 
-#include "AsyncTCP.h"
+#include "esphome/components/socket/socket.h"
 #include "esphome/components/wifi/wifi_component.h"
+#include "esphome/components/network/util.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
@@ -39,7 +40,7 @@ class ModbusTCP16 : public Component, public sensor::Sensor {
   uint32_t update_interval_{60000}; // 60 seconds default
 
   // Connection state
-  AsyncClient *tcp_client_{nullptr};
+  std::unique_ptr<socket::Socket> socket_{nullptr};
   bool connected_{false};
   uint32_t last_update_{0};
   uint16_t transaction_id_{0};
@@ -59,11 +60,11 @@ class ModbusTCP16 : public Component, public sensor::Sensor {
   void process_modbus_response();
   uint16_t calculate_crc(const uint8_t *data, size_t len);
 
-  // TCP callbacks
+  // TCP operations
   void on_tcp_connect();
   void on_tcp_disconnect();
-  void on_tcp_error(int8_t error);
-  void on_tcp_data(const uint8_t *data, size_t len);
+  void on_tcp_error(int error);
+  void check_connection();
 };
 
 }  // namespace modbus_tcp_16
