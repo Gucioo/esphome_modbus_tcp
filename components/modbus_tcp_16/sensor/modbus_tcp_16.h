@@ -2,9 +2,49 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
-#include "esphome/components/wifi/wifi_component.h"
 #include "esphome/components/network/util.h"
+#include "AsyncTCP.h"
+#include "esphome/components/wifi/wifi_component.h"
+#include "esphome/core/log.h"
 
+class ModbusTCP16 : public Component {
+private:
+    AsyncClient* tcp_client_;
+    
+public:
+    void setup() override {
+        tcp_client_ = new AsyncClient();
+        
+        // Set up callbacks
+        tcp_client_->onConnect([this](void* arg, AsyncClient* client) {
+            ESP_LOGD("modbus_tcp", "Connected to server");
+        });
+        
+        tcp_client_->onData([this](void* arg, AsyncClient* client, void* data, size_t len) {
+            // Handle received data
+            uint8_t* buffer = (uint8_t*)data;
+            this->handle_data(buffer, len);
+        });
+        
+        tcp_client_->onError([this](void* arg, AsyncClient* client, int8_t error) {
+            ESP_LOGE("modbus_tcp", "Connection error: %d", error);
+        });
+        
+        tcp_client_->onDisconnect([this](void* arg, AsyncClient* client) {
+            ESP_LOGD("modbus_tcp", "Disconnected from server");
+        });
+    }
+    
+    bool connect(const char* host, uint16_t port) {
+        return tcp_client_->connect(host, port);
+    }
+    
+    void send_data(const uint8_t* data, size_t len) {
+        if (tcp_client_->connected()) {
+            tcp_client_->write((const char*)data, len);
+        }
+    }
+};
 
 namespace esphome {
 namespace modbus_tcp_16 {
